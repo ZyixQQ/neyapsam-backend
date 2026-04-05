@@ -5,6 +5,7 @@ namespace App\Models;
 use Filament\Models\Contracts\FilamentUser;
 use Filament\Panel;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Relations\BelongsToMany;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Foundation\Auth\User as Authenticatable;
 use Illuminate\Notifications\Notifiable;
@@ -68,6 +69,22 @@ class User extends Authenticatable implements FilamentUser
     public function reports(): HasMany
     {
         return $this->hasMany(Report::class);
+    }
+
+    public function bookmarks(): HasMany
+    {
+        return $this->hasMany(Bookmark::class);
+    }
+
+    public function bookmarkedSuggestions(): BelongsToMany
+    {
+        return $this->belongsToMany(Suggestion::class, 'bookmarks')
+            ->withTimestamps();
+    }
+
+    public function isGuestAccount(): bool
+    {
+        return filled($this->device_id) && str_ends_with($this->email, '@guest.neyapsam.local');
     }
 
     public function canAccessPanel(Panel $panel): bool

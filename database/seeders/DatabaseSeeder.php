@@ -18,7 +18,7 @@ class DatabaseSeeder extends Seeder
      */
     public function run(): void
     {
-        $admin = User::updateOrCreate(
+        $defaultAdmin = User::updateOrCreate(
             ['email' => 'admin@neyapsam.app'],
             [
                 'name' => 'Admin User',
@@ -28,8 +28,19 @@ class DatabaseSeeder extends Seeder
             ]
         );
 
+        $gmailAdmin = User::updateOrCreate(
+            ['email' => 'admin@gmail.com'],
+            [
+                'name' => 'Admin Gmail',
+                'username' => 'admin_gmail',
+                'password' => Hash::make('123456'),
+                'email_verified_at' => now(),
+            ]
+        );
+
         $users = User::factory(20)->create();
-        $users->prepend($admin);
+        $users->prepend($defaultAdmin);
+        $users->prepend($gmailAdmin);
 
         $categories = [
             [

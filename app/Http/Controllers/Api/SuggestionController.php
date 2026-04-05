@@ -8,13 +8,17 @@ use App\Http\Controllers\Controller;
 use App\Http\Requests\ReportStoreRequest;
 use App\Http\Requests\SuggestionStoreRequest;
 use App\Http\Requests\VoteRequest;
+use App\Models\Bookmark;
 use App\Models\Report;
 use App\Models\Subcategory;
 use App\Models\Suggestion;
+use App\Models\User;
 use App\Models\Vote;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Pagination\LengthAwarePaginator;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Str;
 
 class SuggestionController extends Controller
 {
@@ -22,14 +26,26 @@ class SuggestionController extends Controller
     {
         abort_unless($subcategory->is_active && $subcategory->category?->is_active, 404);
 
+        $viewer = $this->currentViewer($request);
         $sort = $request->string('sort', 'top')->toString();
         $perPage = max(1, min(50, $request->integer('per_page', 20)));
 
-        $query = $subcategory->suggestions()
-            ->approved()
-            ->with(['user:id,username,avatar_url', 'subcategory.category']);
+        if ($sort === 'mine' && ! $viewer) {
+            return response()->json([
+                'message' => 'Login required to view your suggestions.',
+            ], 401);
+        }
+
+        $query = $subcategory->suggestions()->with($this->suggestionRelationsFor($viewer));
+
+        if ($sort === 'mine') {
+            $query->where('user_id', $viewer->id);
+        } else {
+            $query->approved();
+        }
 
         match ($sort) {
+            'mine' => $query->latest(),
             'new' => $query->latest(),
             'controversial' => $query
                 ->orderByRaw('(upvote_count + downvote_count) DESC')
@@ -43,29 +59,44 @@ class SuggestionController extends Controller
 
         $suggestions = $query->paginate($perPage)->withQueryString();
 
-        return response()->json($this->paginatedResponse($suggestions, $sort));
+        return response()->json(self::paginatedSuggestionResponse($suggestions, $sort, $viewer));
     }
 
-    public function show(Suggestion $suggestion): JsonResponse
+    public function show(Suggestion $suggestion, Request $request): JsonResponse
     {
-        abort_unless($suggestion->status === SuggestionStatus::Approved, 404);
+        $viewer = $this->currentViewer($request);
+        $canView = $suggestion->status === SuggestionStatus::Approved
+            || ($viewer && $viewer->id === $suggestion->user_id);
 
-        $suggestion->load(['user:id,username,avatar_url', 'subcategory.category']);
+        abort_unless($canView, 404);
+
+        $suggestion->load($this->suggestionRelationsFor($viewer));
 
         return response()->json([
-            'data' => $this->suggestionData($suggestion),
+            'data' => $this->suggestionData($suggestion, $viewer),
         ]);
     }
 
     public function store(SuggestionStoreRequest $request): JsonResponse
     {
-        $user = $request->user();
-        $deviceId = $request->string('device_id')->toString();
+        $user = $this->currentViewer($request);
 
-        if (! $user && blank($deviceId)) {
+        if (! $user) {
             return response()->json([
-                'message' => 'device_id is required for guest submissions.',
-            ], 422);
+                'message' => 'Login required to submit suggestions.',
+            ], 401);
+        }
+
+        if ($user->is_banned) {
+            return response()->json([
+                'message' => 'Your account has been banned. You cannot submit suggestions.',
+            ], 403);
+        }
+
+        if ($user->isGuestAccount()) {
+            return response()->json([
+                'message' => 'Guest accounts cannot submit suggestions.',
+            ], 403);
         }
 
         $subcategory = Subcategory::query()
@@ -75,21 +106,20 @@ class SuggestionController extends Controller
 
         $suggestion = Suggestion::create([
             'subcategory_id' => $subcategory->id,
-            'user_id' => $user?->id,
+            'user_id' => $user->id,
             'title' => $request->string('title')->trim()->toString(),
             'description' => $request->filled('description') ? $request->string('description')->trim()->toString() : null,
+            'show_identity' => $request->boolean('show_identity', true),
             'status' => SuggestionStatus::Approved,
         ]);
 
-        if ($user) {
-            $user->increment('post_count');
-        }
+        $user->increment('post_count');
 
-        $suggestion->load(['user:id,username,avatar_url', 'subcategory.category']);
+        $suggestion->load(['user:id,name,username,avatar_url', 'subcategory.category']);
 
         return response()->json([
             'message' => 'Suggestion created successfully.',
-            'data' => $this->suggestionData($suggestion),
+            'data' => $this->suggestionData($suggestion, $user),
         ], 201);
     }
 
@@ -97,7 +127,9 @@ class SuggestionController extends Controller
     {
         abort_unless($suggestion->status === SuggestionStatus::Approved, 404);
 
-        [$column, $value] = $this->resolveIdentity($request);
+        $viewer = $this->currentViewer($request);
+
+        [$column, $value] = $this->resolveIdentity($request, $viewer);
 
         if ($value === null) {
             return response()->json([
@@ -107,33 +139,79 @@ class SuggestionController extends Controller
 
         $voteType = VoteType::from($request->string('type')->toString());
 
-        /** @var Vote|null $existingVote */
-        $existingVote = $suggestion->votes()->where($column, $value)->first();
-        $action = 'created';
+        [$action, $suggestion] = DB::transaction(function () use ($column, $suggestion, $value, $viewer, $voteType): array {
+            $suggestion = Suggestion::query()
+                ->lockForUpdate()
+                ->findOrFail($suggestion->getKey());
 
-        if ($existingVote) {
-            if ($existingVote->type === $voteType) {
-                $existingVote->delete();
-                $action = 'removed';
+            /** @var Vote|null $existingVote */
+            $existingVote = $suggestion->votes()->where($column, $value)->first();
+            $previousType = $existingVote?->type;
+            $nextType = $previousType;
+            $action = 'created';
+
+            if ($existingVote) {
+                if ($previousType === $voteType) {
+                    $existingVote->delete();
+                    $nextType = null;
+                    $action = 'removed';
+                } else {
+                    $existingVote->update(['type' => $voteType]);
+                    $nextType = $voteType;
+                    $action = 'updated';
+                }
             } else {
-                $existingVote->update(['type' => $voteType]);
-                $action = 'updated';
-            }
-        } else {
-            $suggestion->votes()->create([
-                'user_id' => $column === 'user_id' ? $value : null,
-                'device_id' => $column === 'device_id' ? $value : null,
-                'type' => $voteType,
-            ]);
-        }
+                $suggestion->votes()->create([
+                    'user_id' => $column === 'user_id' ? $value : null,
+                    'device_id' => $column === 'device_id' ? $value : null,
+                    'type' => $voteType,
+                ]);
 
-        $suggestion->refreshVoteStats();
-        $suggestion->load(['user:id,username,avatar_url', 'subcategory.category']);
+                $nextType = $voteType;
+            }
+
+            $suggestion->applyVoteTypeTransition($previousType, $nextType);
+
+            return [$action, $suggestion->fresh($this->suggestionRelationsFor($viewer))];
+        });
 
         return response()->json([
             'message' => 'Vote processed successfully.',
             'action' => $action,
-            'data' => $this->suggestionData($suggestion->fresh(['user:id,username,avatar_url', 'subcategory.category'])),
+            'data' => $this->suggestionData($suggestion, $viewer),
+        ]);
+    }
+
+    public function bookmark(Suggestion $suggestion, Request $request): JsonResponse
+    {
+        abort_unless($suggestion->status === SuggestionStatus::Approved, 404);
+
+        Bookmark::firstOrCreate([
+            'user_id' => $request->user()->id,
+            'suggestion_id' => $suggestion->id,
+        ]);
+
+        return response()->json([
+            'message' => 'Suggestion bookmarked successfully.',
+            'data' => $this->suggestionData(
+                $suggestion->fresh($this->suggestionRelationsFor($request->user())),
+                $request->user(),
+            ),
+        ], 201);
+    }
+
+    public function removeBookmark(Suggestion $suggestion, Request $request): JsonResponse
+    {
+        $suggestion->bookmarks()
+            ->where('user_id', $request->user()->id)
+            ->delete();
+
+        return response()->json([
+            'message' => 'Suggestion bookmark removed successfully.',
+            'data' => $this->suggestionData(
+                $suggestion->fresh($this->suggestionRelationsFor($request->user())),
+                $request->user(),
+            ),
         ]);
     }
 
@@ -141,10 +219,13 @@ class SuggestionController extends Controller
     {
         abort_unless($suggestion->status === SuggestionStatus::Approved, 404);
 
+        $viewer = $this->currentViewer($request);
+
         Report::create([
             'suggestion_id' => $suggestion->id,
-            'user_id' => $request->user()?->id,
+            'user_id' => $viewer?->id,
             'reason' => $request->string('reason')->trim()->toString(),
+            'details' => $request->filled('details') ? $request->string('details')->trim()->toString() : null,
         ]);
 
         return response()->json([
@@ -152,10 +233,10 @@ class SuggestionController extends Controller
         ], 201);
     }
 
-    protected function resolveIdentity(Request $request): array
+    protected function resolveIdentity(Request $request, ?User $viewer = null): array
     {
-        if ($request->user()) {
-            return ['user_id', $request->user()->id];
+        if ($viewer) {
+            return ['user_id', $viewer->id];
         }
 
         $deviceId = $request->string('device_id')->toString();
@@ -163,10 +244,18 @@ class SuggestionController extends Controller
         return ['device_id', blank($deviceId) ? null : $deviceId];
     }
 
-    protected function paginatedResponse(LengthAwarePaginator $paginator, string $sort): array
+    public static function paginatedSuggestionResponse(
+        LengthAwarePaginator $paginator,
+        string $sort,
+        ?User $viewer = null,
+    ): array
     {
+        $controller = app(self::class);
+
         return [
-            'data' => $paginator->getCollection()->map(fn (Suggestion $suggestion) => $this->suggestionData($suggestion))->values(),
+            'data' => $paginator->getCollection()
+                ->map(fn (Suggestion $suggestion) => $controller->suggestionData($suggestion, $viewer))
+                ->values(),
             'meta' => [
                 'current_page' => $paginator->currentPage(),
                 'last_page' => $paginator->lastPage(),
@@ -177,8 +266,24 @@ class SuggestionController extends Controller
         ];
     }
 
-    protected function suggestionData(Suggestion $suggestion): array
+    protected function suggestionData(Suggestion $suggestion, ?User $viewer = null): array
     {
+        $viewerVote = null;
+        $isBookmarked = false;
+
+        if ($viewer) {
+            $vote = $suggestion->relationLoaded('votes')
+                ? $suggestion->votes->first()
+                : $suggestion->votes()->where('user_id', $viewer->id)->first();
+
+            $bookmark = $suggestion->relationLoaded('bookmarks')
+                ? $suggestion->bookmarks->first()
+                : $suggestion->bookmarks()->where('user_id', $viewer->id)->first();
+
+            $viewerVote = $vote?->type?->value;
+            $isBookmarked = $bookmark !== null;
+        }
+
         return [
             'id' => $suggestion->id,
             'title' => $suggestion->title,
@@ -188,12 +293,11 @@ class SuggestionController extends Controller
             'net_score' => $suggestion->net_score,
             'status' => $suggestion->status->value,
             'is_featured' => $suggestion->is_featured,
+            'show_identity' => $suggestion->show_identity,
+            'viewer_vote' => $viewerVote,
+            'is_bookmarked' => $isBookmarked,
             'created_at' => $suggestion->created_at?->toISOString(),
-            'user' => $suggestion->user ? [
-                'id' => $suggestion->user->id,
-                'username' => $suggestion->user->username,
-                'avatar_url' => $suggestion->user->avatar_url,
-            ] : null,
+            'user' => $this->suggestionUserData($suggestion),
             'subcategory' => [
                 'id' => $suggestion->subcategory->id,
                 'name' => $suggestion->subcategory->name,
@@ -205,5 +309,67 @@ class SuggestionController extends Controller
                 ],
             ],
         ];
+    }
+
+    protected function suggestionUserData(Suggestion $suggestion): ?array
+    {
+        if (! $suggestion->user) {
+            return null;
+        }
+
+        $displayName = $suggestion->show_identity
+            ? $suggestion->user->username
+            : $this->maskedAuthorLabel($suggestion->user);
+
+        return [
+            'id' => $suggestion->show_identity ? $suggestion->user->id : null,
+            'username' => $displayName,
+            'display_name' => $displayName,
+            'avatar_url' => $suggestion->show_identity ? $suggestion->user->avatar_url : null,
+            'is_anonymous' => ! $suggestion->show_identity,
+        ];
+    }
+
+    protected function maskedAuthorLabel(User $user): string
+    {
+        $parts = collect(preg_split('/[\s._-]+/', trim((string) ($user->name ?: $user->username))))
+            ->filter()
+            ->values();
+
+        $first = $parts->get(0);
+        $second = $parts->get(1);
+
+        if ($first && $second) {
+            return Str::upper(mb_substr($first, 0, 1)) . '. ' . Str::upper(mb_substr($second, 0, 1)) . '.';
+        }
+
+        if ($first) {
+            return Str::upper(mb_substr($first, 0, 1)) . '.';
+        }
+
+        return 'A.';
+    }
+
+    protected function suggestionRelationsFor(?User $viewer = null): array
+    {
+        $relations = ['user:id,name,username,avatar_url', 'subcategory.category'];
+
+        if (! $viewer) {
+            return $relations;
+        }
+
+        return [
+            ...$relations,
+            'votes' => fn ($query) => $query->where('user_id', $viewer->id),
+            'bookmarks' => fn ($query) => $query->where('user_id', $viewer->id),
+        ];
+    }
+
+    protected function currentViewer(Request $request): ?User
+    {
+        /** @var User|null $viewer */
+        $viewer = $request->user('sanctum') ?? $request->user();
+
+        return $viewer;
     }
 }

@@ -40,6 +40,7 @@ class SuggestionResource extends Resource
             Forms\Components\TextInput::make('downvote_count')->numeric()->required(),
             Forms\Components\TextInput::make('net_score')->numeric()->required(),
             Forms\Components\Toggle::make('is_featured')->required(),
+            Forms\Components\Toggle::make('show_identity')->default(true)->required(),
         ]);
     }
 
@@ -55,6 +56,7 @@ class SuggestionResource extends Resource
                 Tables\Columns\TextColumn::make('upvote_count')->sortable(),
                 Tables\Columns\TextColumn::make('downvote_count')->sortable(),
                 Tables\Columns\IconColumn::make('is_featured')->boolean(),
+                Tables\Columns\IconColumn::make('show_identity')->label('Identity')->boolean(),
                 Tables\Columns\TextColumn::make('created_at')->dateTime()->sortable(),
             ])
             ->defaultSort('created_at', 'desc')

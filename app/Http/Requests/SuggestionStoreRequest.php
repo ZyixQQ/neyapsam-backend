@@ -17,6 +17,7 @@ class SuggestionStoreRequest extends FormRequest
             'subcategory_id' => ['required', 'exists:subcategories,id'],
             'title' => ['required', 'string', 'max:120'],
             'description' => ['nullable', 'string'],
+            'show_identity' => ['nullable', 'boolean'],
             'device_id' => ['nullable', 'string', 'max:191'],
         ];
     }
