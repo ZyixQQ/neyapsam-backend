@@ -28,6 +28,7 @@ class DatabaseSeeder extends Seeder
             ['email' => 'admin@gmail.com'],
             [
                 'name' => 'Admin Gmail',
+                'is_admin' => true,
                 'username' => 'admin_gmail',
                 'password' => Hash::make('123456'),
                 'email_verified_at' => now(),
