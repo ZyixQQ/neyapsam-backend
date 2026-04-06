@@ -30,6 +30,11 @@ class User extends Authenticatable implements FilamentUser
         'device_id',
         'post_count',
         'is_banned',
+        'is_admin',
+        'push_token',
+        'platform',
+        'push_notifications_enabled',
+        'push_token_updated_at',
     ];
 
     /**
@@ -50,9 +55,12 @@ class User extends Authenticatable implements FilamentUser
     protected function casts(): array
     {
         return [
-            'email_verified_at' => 'datetime',
-            'is_banned' => 'boolean',
-            'password' => 'hashed',
+            'email_verified_at'           => 'datetime',
+            'push_token_updated_at'       => 'datetime',
+            'is_banned'                   => 'boolean',
+            'is_admin'                    => 'boolean',
+            'push_notifications_enabled'  => 'boolean',
+            'password'                    => 'hashed',
         ];
     }
 
@@ -89,6 +97,6 @@ class User extends Authenticatable implements FilamentUser
 
     public function canAccessPanel(Panel $panel): bool
     {
-        return ! $this->is_banned;
+        return $this->is_admin && ! $this->is_banned;
     }
 }
